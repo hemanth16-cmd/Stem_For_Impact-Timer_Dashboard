@@ -68,17 +68,18 @@ if (!DEV && !BUILD_MATCHES) {
 }
 
 // ---------- admin PIN ----------
-function loadPin(): string {
-  if (process.env.ADMIN_PIN) return process.env.ADMIN_PIN.trim();
+function loadPin(): { pin: string; isFromEnv: boolean } {
+  const envPin = process.env.ADMIN_PIN?.trim();
+  if (envPin) return { pin: envPin, isFromEnv: true };
   try {
     const p = fs.readFileSync(PIN_FILE, 'utf8').trim();
-    if (p) return p;
+    if (p) return { pin: p, isFromEnv: false };
   } catch { /* first run */ }
   const p = String(crypto.randomInt(100000, 999999));
   fs.writeFileSync(PIN_FILE, p + '\n');
-  return p;
+  return { pin: p, isFromEnv: false };
 }
-const ADMIN_PIN = loadPin();
+const { pin: ADMIN_PIN, isFromEnv: PIN_FROM_ENV } = loadPin();
 const pinOk = (pin: string) => {
   const a = crypto.createHash('sha256').update(pin.trim()).digest();
   const b = crypto.createHash('sha256').update(ADMIN_PIN).digest();
@@ -178,6 +179,7 @@ setInterval(takeSnapshot, 10 * 60_000).unref();
 // ---------- http ----------
 const app = express();
 app.disable('x-powered-by');
+app.set('trust proxy', 1);
 app.get('/api/health', (_req, res) => {
   res.set('Cache-Control', 'no-store');
   res.json({ ok: true, serverNow: Date.now(), build: BUILD_ID, recovery: !!recovery });
@@ -204,26 +206,110 @@ interface Client extends WebSocket {
   connId: string; ip: string; role: Role; isAdmin: boolean; alive: boolean;
   tokens: number; lastRefill: number; malformed: number; info: DisplayInfo;
 }
-const allowedOrigins = new Set((process.env.ALLOWED_ORIGINS ?? '').split(',').map((s) => s.trim()).filter(Boolean));
-const allowedHosts = new Set((process.env.ALLOWED_HOSTS ?? '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean));
+
+const PRODUCTION_HOSTS = ['stem-for-impact-timer-dashboard.onrender.com'];
+const PRODUCTION_ORIGINS = [
+  'https://stem-for-impact-timer-dashboard.onrender.com',
+  'http://stem-for-impact-timer-dashboard.onrender.com',
+];
+
+const renderHost = process.env.RENDER_EXTERNAL_HOSTNAME?.trim().toLowerCase();
+const renderUrl = process.env.RENDER_EXTERNAL_URL?.trim();
+let renderUrlHost = '';
+if (renderUrl) {
+  try { renderUrlHost = new URL(renderUrl).hostname.toLowerCase(); } catch { /* ignore */ }
+}
+
+const allowedOrigins = new Set([
+  ...PRODUCTION_ORIGINS,
+  ...(process.env.ALLOWED_ORIGINS ?? '').split(',').map((s) => s.trim()).filter(Boolean),
+  ...(renderUrl ? [renderUrl] : []),
+  ...(renderHost ? [`https://${renderHost}`, `http://${renderHost}`] : []),
+]);
+
+const allowedHosts = new Set([
+  ...PRODUCTION_HOSTS,
+  ...(process.env.ALLOWED_HOSTS ?? '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean),
+  ...(renderHost ? [renderHost] : []),
+  ...(renderUrlHost ? [renderUrlHost] : []),
+]);
+
 const localAddrs = () => new Set(['localhost', '127.0.0.1', '::1', '[::1]', os.hostname().toLowerCase(),
   ...Object.values(os.networkInterfaces()).flat().filter(Boolean).map((i) => i!.address.toLowerCase())]);
 
-/** Hostname must be this machine (or explicitly allowed) — blocks DNS-rebinding pages. */
-function hostAllowed(hostHeader: string | undefined): boolean {
-  if (!hostHeader) return false;
-  let hostname: string;
-  try { hostname = new URL(`http://${hostHeader}`).hostname.toLowerCase(); } catch { return false; }
-  return localAddrs().has(hostname) || localAddrs().has(hostname.replace(/^\[|\]$/g, '')) || allowedHosts.has(hostname)
-    || hostname.endsWith('.local');
+function parseHostname(hostHeader: string | undefined): string | null {
+  if (!hostHeader) return null;
+  try {
+    return new URL(`http://${hostHeader}`).hostname.toLowerCase();
+  } catch {
+    return null;
+  }
 }
+
+function isHostAllowed(hostname: string): boolean {
+  const norm = hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  return localAddrs().has(hostname)
+    || localAddrs().has(norm)
+    || allowedHosts.has(hostname)
+    || allowedHosts.has(norm)
+    || norm.endsWith('.local');
+}
+
+/** Hostname must be this machine, production domain, or explicitly allowed — blocks DNS-rebinding pages. */
+function hostAllowed(hostHeader: string | undefined): boolean {
+  const hostname = parseHostname(hostHeader);
+  if (!hostname) return false;
+  return isHostAllowed(hostname);
+}
+
 /** Browsers always send Origin; it must be the page that the server itself served. */
-function originAllowed(origin: string | undefined, host: string | undefined): boolean {
+function originAllowed(origin: string | undefined, hostHeader: string | undefined): boolean {
   if (!origin) return true; // non-browser tools (tests, scripts) — they still need the PIN to change anything
   if (allowedOrigins.has(origin)) return true;
-  try { return new URL(origin).host.toLowerCase() === (host ?? '').toLowerCase(); } catch { return false; }
+  try {
+    const originUrl = new URL(origin);
+    const originHost = originUrl.host.toLowerCase();
+    const originHostname = originUrl.hostname.toLowerCase();
+
+    // Direct match against effective host header (e.g. host:port or host)
+    if (hostHeader) {
+      if (originHost === hostHeader.toLowerCase()) return true;
+      const hostHostname = parseHostname(hostHeader);
+      if (hostHostname && originHostname === hostHostname && isHostAllowed(hostHostname)) {
+        return true;
+      }
+    }
+
+    // Origin hostname matches an authorized host
+    if (isHostAllowed(originHostname)) {
+      return true;
+    }
+
+    return false;
+  } catch {
+    return false;
+  }
 }
-const ipOf = (req: IncomingMessage) => (req.socket.remoteAddress ?? 'unknown').replace(/^::ffff:/, '');
+
+function getHostHeader(req: IncomingMessage): string | undefined {
+  const forwarded = req.headers['x-forwarded-host'];
+  if (forwarded) {
+    const raw = Array.isArray(forwarded) ? forwarded[0] : forwarded;
+    const h = raw.split(',')[0].trim();
+    if (h) return h;
+  }
+  return req.headers.host;
+}
+
+const ipOf = (req: IncomingMessage) => {
+  const forwarded = req.headers['x-forwarded-for'];
+  if (forwarded) {
+    const raw = Array.isArray(forwarded) ? forwarded[0] : forwarded;
+    const clientIp = raw.split(',')[0].trim();
+    if (clientIp) return clientIp.replace(/^::ffff:/, '');
+  }
+  return (req.socket.remoteAddress ?? 'unknown').replace(/^::ffff:/, '');
+};
 
 const wss = new WebSocketServer({
   server,
@@ -231,8 +317,15 @@ const wss = new WebSocketServer({
   maxPayload: LIMITS.maxPayload,
   verifyClient: (info, cb) => {
     const ip = ipOf(info.req);
-    if (!hostAllowed(info.req.headers.host)) { log(`x rejected ws from ${ip}: host ${info.req.headers.host}`); return cb(false, 403, 'Host not allowed'); }
-    if (!originAllowed(info.origin, info.req.headers.host)) { log(`x rejected ws from ${ip}: origin ${info.origin}`); return cb(false, 403, 'Origin not allowed'); }
+    const host = getHostHeader(info.req);
+    if (!hostAllowed(host)) {
+      log(`x rejected ws from ${ip}: host ${host ?? info.req.headers.host}`);
+      return cb(false, 403, 'Host not allowed');
+    }
+    if (!originAllowed(info.origin, host)) {
+      log(`x rejected ws from ${ip}: origin ${info.origin}`);
+      return cb(false, 403, 'Origin not allowed');
+    }
     if (wss.clients.size >= LIMITS.maxClients) return cb(false, 503, 'Too many connections');
     let fromIp = 0;
     for (const c of wss.clients as Set<Client>) if (c.ip === ip) fromIp++;
@@ -516,7 +609,14 @@ server.listen(PORT, process.env.HOST ?? '0.0.0.0', () => {
   console.log(`\n  Projector display : http://localhost:${PORT}/`);
   console.log(`  Organizer panel   : http://localhost:${PORT}/admin`);
   for (const ip of ips) console.log(`  On the same Wi-Fi : http://${ip}:${PORT}/  and  http://${ip}:${PORT}/admin`);
-  console.log(`\n  Admin PIN         : ${ADMIN_PIN}   (set ADMIN_PIN env var or edit ${path.relative(ROOT, PIN_FILE) || PIN_FILE})`);
+  const isCloudOrProd = !!(process.env.RENDER || process.env.NODE_ENV === 'production');
+  const pinDisplay = isCloudOrProd && PIN_FROM_ENV
+    ? '•••••• (supplied securely via ADMIN_PIN env var)'
+    : `${ADMIN_PIN}   (${PIN_FROM_ENV ? 'from ADMIN_PIN env var' : `set ADMIN_PIN env var or edit ${path.relative(ROOT, PIN_FILE) || PIN_FILE}`})`;
+  console.log(`\n  Admin PIN         : ${pinDisplay}`);
+  if (isCloudOrProd && !PIN_FROM_ENV) {
+    console.warn('  !! SECURITY NOTICE: ADMIN_PIN environment variable is not configured. For production, set ADMIN_PIN in the Render dashboard.');
+  }
   console.log(`  Data folder       : ${DATA_DIR}`);
   console.log(`  Saved state       : ${recovery ? 'RECOVERY NEEDED — see organizer panel' : `${health.source}, rev ${state?.rev}`}\n${line}\n`);
 });

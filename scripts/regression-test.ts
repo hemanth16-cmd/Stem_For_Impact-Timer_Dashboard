@@ -56,8 +56,8 @@ class Client {
   info: ServerInfo | null = null;
   opened: Promise<boolean>;
   private n = 0;
-  constructor(port: number, opts: { origin?: string; host?: string; role?: string } = {}) {
-    const headers: Record<string, string> = {};
+  constructor(port: number, opts: { origin?: string; host?: string; role?: string; headers?: Record<string, string> } = {}) {
+    const headers: Record<string, string> = { ...opts.headers };
     if (opts.host) headers.Host = opts.host;
     this.ws = new WebSocket(`ws://localhost:${port}/ws`, { origin: opts.origin, headers });
     this.opened = new Promise((res) => {
@@ -167,6 +167,27 @@ async function security() {
   check('DNS-rebinding Host rejected (403)', !(await rebind.opened) && rebind.rejected === 403);
   const same = new Client(s.port, { origin: `http://localhost:${s.port}` });
   check('same-origin browser connection accepted', await same.opened);
+
+  const prod = new Client(s.port, {
+    origin: 'https://stem-for-impact-timer-dashboard.onrender.com',
+    host: 'stem-for-impact-timer-dashboard.onrender.com',
+  });
+  check('production hostname & HTTPS origin accepted', await prod.opened);
+  prod.close();
+
+  const proxied = new Client(s.port, {
+    origin: 'https://stem-for-impact-timer-dashboard.onrender.com',
+    headers: { 'x-forwarded-host': 'stem-for-impact-timer-dashboard.onrender.com' },
+  });
+  check('reverse proxy x-forwarded-host accepted', await proxied.opened);
+  proxied.close();
+
+  const evilProd = new Client(s.port, {
+    origin: 'http://evil.example',
+    host: 'stem-for-impact-timer-dashboard.onrender.com',
+  });
+  check('foreign origin against production host rejected (403)', !(await evilProd.opened) && evilProd.rejected === 403);
+
   const many: Client[] = [];
   for (let i = 0; i < 6; i++) { const c = new Client(s.port); many.push(c); await c.opened; }
   check('per-address connection limit enforced (429)', many.filter((c) => c.rejected === 429).length >= 1);
